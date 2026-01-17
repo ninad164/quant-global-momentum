@@ -8,3 +8,6 @@ __pycache__/
 # Data (never commit raw or processed data)
 data/raw/
 data/processed/
+
+.vscode/
+results/
