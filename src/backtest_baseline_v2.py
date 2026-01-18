@@ -1,6 +1,7 @@
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 FEATURES_PATH = Path("data/processed/us_features.parquet")
 RESULTS_DIR = Path("results")
@@ -55,6 +56,13 @@ def compute_weights_for_date(df_date: pd.DataFrame) -> pd.Series:
 
     w = inv_vol / inv_vol.sum()
     w.index = x["ticker"].values
+    # --- NEW: cap max weight to reduce concentration ---
+    MAX_W = 0.10  # 10% cap per stock
+    w = w.clip(upper=MAX_W)
+
+    # re-normalize after capping
+    if w.sum() != 0:
+        w = w / w.sum()
     return w
 
 def turnover(prev_w: pd.Series, new_w: pd.Series) -> float:
@@ -62,6 +70,16 @@ def turnover(prev_w: pd.Series, new_w: pd.Series) -> float:
     pw = prev_w.reindex(all_idx).fillna(0.0)
     nw = new_w.reindex(all_idx).fillna(0.0)
     return 0.5 * (nw - pw).abs().sum()
+
+def get_spy_regime(start_date, end_date):
+    spy = yf.download("SPY", start=start_date, end=end_date, auto_adjust=True, progress=False)
+    if spy.empty:
+        raise RuntimeError("Failed to download SPY data for regime detection.")
+    spy = spy.reset_index().rename(columns={"Date": "date"})
+    spy["date"] = pd.to_datetime(spy["date"])
+    spy = spy.sort_values("date")
+    spy["sma_200"] = spy["Close"].rolling(200).mean()
+    return spy.set_index("date")[["Close", "sma_200"]]
 
 def main():
     if not FEATURES_PATH.exists():
@@ -75,11 +93,39 @@ def main():
 
     rebal_dates = pick_rebalance_dates(df["date"], step=M)
 
+    # SPY regime filter data (buffer around backtest window)
+    start = (rebal_dates.min() - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+    end = (rebal_dates.max() + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+    spy_regime = get_spy_regime(start, end)
+
     equity = 1.0
     equity_curve = []
     prev_w = pd.Series(dtype=float)
 
     for dt in rebal_dates:
+        # Regime check: invest only when SPY > 200d SMA
+        try:
+            spy_row = spy_regime.loc[:dt].iloc[-1]
+            # risk_on = float(spy_row["Close"]) > float(spy_row["sma_200"])
+            risk_on = float(spy_row["Close"].iloc[0]) > float(spy_row["sma_200"].iloc[0])
+        except Exception:
+            risk_on = True  # if missing data, default to risk-on
+
+        if not risk_on:
+            # Go to cash for this month (zero exposure)
+            w = pd.Series(dtype=float)
+            t = turnover(prev_w, w)
+            cost = (COST_BPS / 10000.0) * t
+            net_ret = 0.0 - cost
+
+            equity *= (1.0 + net_ret)
+            equity_curve.append(
+                {"date": dt, "gross_ret": 0.0, "turnover": float(t),
+                "cost": float(cost), "net_ret": float(net_ret), "equity": float(equity)}
+            )
+            prev_w = w
+            continue
+
         slice_dt = df[df["date"] == dt]
         if slice_dt.empty:
             continue
@@ -88,21 +134,36 @@ def main():
         if new_w.empty:
             continue
 
-        fwd = slice_dt.set_index("ticker")["fwd_ret_21d"]
-        port_ret = (new_w.reindex(fwd.index).fillna(0.0) * fwd).sum()
+        # NEW: smooth weights to reduce whipsaw
+        if not prev_w.empty:
+            all_idx = prev_w.index.union(new_w.index)
+            prev_aligned = prev_w.reindex(all_idx).fillna(0.0)
+            new_aligned = new_w.reindex(all_idx).fillna(0.0)
 
-        t = turnover(prev_w, new_w)
+            SMOOTH = 0.2  # 20% new weights, 80% old
+            w = (1.0 - SMOOTH) * prev_aligned + SMOOTH * new_aligned
+
+            if w.sum() != 0:
+                w = w / w.sum()
+
+            w = w[w.abs() > 1e-6]
+        else:
+            w = new_w
+
+        fwd = slice_dt.set_index("ticker")["fwd_ret_21d"]
+        port_ret = (w.reindex(fwd.index).fillna(0.0) * fwd).sum()
+
+        t = turnover(prev_w, w)
         cost = (COST_BPS / 10000.0) * t
         net_ret = port_ret - cost
-
+    
         equity *= (1.0 + net_ret)
 
         equity_curve.append(
             {"date": dt, "gross_ret": float(port_ret), "turnover": float(t),
              "cost": float(cost), "net_ret": float(net_ret), "equity": float(equity)}
         )
-        prev_w = new_w
-
+        prev_w = w
     ec = pd.DataFrame(equity_curve)
     if ec.empty:
         raise RuntimeError("Equity curve is empty. Check filters/universe size.")
